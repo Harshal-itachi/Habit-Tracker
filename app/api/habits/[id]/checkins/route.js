@@ -14,7 +14,11 @@ import {
   isValidLocalDate,
 } from "@/lib/timezone";
 
-import { createCheckInSchema } from "@/validations/checkin";
+/*
+|--------------------------------------------------------------------------
+| Validate MongoDB ObjectId
+|--------------------------------------------------------------------------
+*/
 
 function isValidObjectId(id) {
   return mongoose.Types.ObjectId.isValid(id);
@@ -45,21 +49,21 @@ export async function POST(request, { params }) {
       return NextResponse.json(
         {
           success: false,
-          message: auth.message,
+          message: auth.message || "Unauthorized",
         },
         {
-          status: auth.status,
+          status: auth.status || 401,
         }
       );
     }
 
-    const { id } = await params;
-
     /*
     |--------------------------------------------------------------------------
-    | Validate habit ID
+    | Get habit ID
     |--------------------------------------------------------------------------
     */
+
+    const { id } = await params;
 
     if (!isValidObjectId(id)) {
       return NextResponse.json(
@@ -76,13 +80,13 @@ export async function POST(request, { params }) {
 
     /*
     |--------------------------------------------------------------------------
-    | Get user
+    | Find user
     |--------------------------------------------------------------------------
     */
 
-    const user = await User.findById(auth.userId).select(
-      "_id timezone"
-    );
+    const user = await User.findById(
+      auth.userId
+    ).select("_id timezone");
 
     if (!user) {
       return NextResponse.json(
@@ -99,7 +103,27 @@ export async function POST(request, { params }) {
 
     /*
     |--------------------------------------------------------------------------
-    | Make sure habit belongs to this user
+    | User timezone must exist
+    |--------------------------------------------------------------------------
+    */
+
+    if (!user.timezone) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "TIMEZONE_NOT_CONFIGURED",
+          message:
+            "Your timezone is not configured",
+        },
+        {
+          status: 400,
+        }
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Make sure habit belongs to logged-in user
     |--------------------------------------------------------------------------
     */
 
@@ -123,21 +147,20 @@ export async function POST(request, { params }) {
 
     /*
     |--------------------------------------------------------------------------
-    | Validate request body
+    | Read request body
     |--------------------------------------------------------------------------
     */
 
-    const body = await request.json();
+    let body;
 
-    const validation = createCheckInSchema.safeParse(body);
-
-    if (!validation.success) {
+    try {
+      body = await request.json();
+    } catch {
       return NextResponse.json(
         {
           success: false,
-          code: "VALIDATION_ERROR",
-          message: "Validation failed",
-          errors: validation.error.flatten().fieldErrors,
+          code: "INVALID_JSON",
+          message: "Request body must contain valid JSON",
         },
         {
           status: 400,
@@ -145,21 +168,61 @@ export async function POST(request, { params }) {
       );
     }
 
-    const { date } = validation.data;
+    const { date } = body;
 
     /*
     |--------------------------------------------------------------------------
-    | Validate that date is an actual calendar date
+    | Validate date format
     |--------------------------------------------------------------------------
     */
 
-    if (!isValidLocalDate(date, user.timezone)) {
+    if (!date) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "DATE_REQUIRED",
+          message: "Date is required",
+        },
+        {
+          status: 400,
+        }
+      );
+    }
+
+    if (
+      typeof date !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(date)
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "INVALID_DATE_FORMAT",
+          message:
+            "Date must be in YYYY-MM-DD format",
+        },
+        {
+          status: 400,
+        }
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate actual calendar date
+    |--------------------------------------------------------------------------
+    */
+
+    const validDate = isValidLocalDate(
+      date,
+      user.timezone
+    );
+
+    if (!validDate) {
       return NextResponse.json(
         {
           success: false,
           code: "INVALID_DATE",
-          message:
-            "Invalid date. Please provide a valid local date in YYYY-MM-DD format.",
+          message: "The provided date is invalid",
         },
         {
           status: 400,
@@ -169,19 +232,26 @@ export async function POST(request, { params }) {
 
     /*
     |--------------------------------------------------------------------------
-    | Get today's date according to the user's timezone
+    | Get today's local date
     |--------------------------------------------------------------------------
     */
 
-    const today = getTodayInTimezone(user.timezone);
+    const today = getTodayInTimezone(
+      user.timezone
+    );
 
     /*
     |--------------------------------------------------------------------------
-    | Reject future dates
+    | Reject future date
     |--------------------------------------------------------------------------
     */
 
-    if (isFutureLocalDate(date, user.timezone)) {
+    if (
+      isFutureLocalDate(
+        date,
+        user.timezone
+      )
+    ) {
       return NextResponse.json(
         {
           success: false,
@@ -196,15 +266,16 @@ export async function POST(request, { params }) {
 
     /*
     |--------------------------------------------------------------------------
-    | Check whether this local date already exists
+    | Prevent duplicate check-in
     |--------------------------------------------------------------------------
     */
 
-    const existingCheckIn = await CheckIn.findOne({
-      habitId: habit._id,
-      userId: auth.userId,
-      localDate: date,
-    });
+    const existingCheckIn =
+      await CheckIn.findOne({
+        habitId: habit._id,
+        userId: auth.userId,
+        localDate: date,
+      });
 
     if (existingCheckIn) {
       return NextResponse.json(
@@ -236,9 +307,11 @@ export async function POST(request, { params }) {
         {
           success: true,
           message: "Check-in recorded successfully",
+
           checkIn: {
             id: checkIn._id,
             habitId: checkIn.habitId,
+            userId: checkIn.userId,
             localDate: checkIn.localDate,
           },
         },
@@ -249,8 +322,13 @@ export async function POST(request, { params }) {
     } catch (error) {
       /*
       |--------------------------------------------------------------------------
-      | Handle database unique-index race condition
+      | MongoDB duplicate-key protection
       |--------------------------------------------------------------------------
+      |
+      | Even if two requests arrive at exactly the same
+      | time, the database unique index should prevent
+      | duplicate local dates.
+      |
       */
 
       if (error?.code === 11000) {
@@ -269,13 +347,148 @@ export async function POST(request, { params }) {
       throw error;
     }
   } catch (error) {
-    console.error("Create check-in error:", error);
+    console.error(
+      "================================"
+    );
+
+    console.error("CREATE CHECK-IN ERROR:");
+    console.error(error);
+
+    console.error(
+      "================================"
+    );
 
     return NextResponse.json(
       {
         success: false,
         code: "CHECKIN_CREATE_FAILED",
-        message: "Failed to create check-in",
+        message:
+          error?.message ||
+          "Failed to create check-in",
+      },
+      {
+        status: 500,
+      }
+    );
+  }
+}
+
+/*
+|--------------------------------------------------------------------------
+| GET /api/habits/:id/checkins
+|--------------------------------------------------------------------------
+|
+| Get all check-ins for a specific habit.
+|
+*/
+
+export async function GET(request, { params }) {
+  try {
+    await connectDB();
+
+    /*
+    |--------------------------------------------------------------------------
+    | Authenticate
+    |--------------------------------------------------------------------------
+    */
+
+    const auth = await authenticateUser();
+
+    if (!auth.success) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: auth.message || "Unauthorized",
+        },
+        {
+          status: auth.status || 401,
+        }
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Get habit ID
+    |--------------------------------------------------------------------------
+    */
+
+    const { id } = await params;
+
+    if (!isValidObjectId(id)) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "INVALID_HABIT_ID",
+          message: "Invalid habit ID",
+        },
+        {
+          status: 400,
+        }
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Make sure habit belongs to user
+    |--------------------------------------------------------------------------
+    */
+
+    const habit = await Habit.findOne({
+      _id: id,
+      userId: auth.userId,
+    });
+
+    if (!habit) {
+      return NextResponse.json(
+        {
+          success: false,
+          code: "HABIT_NOT_FOUND",
+          message: "Habit not found",
+        },
+        {
+          status: 404,
+        }
+      );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Get check-ins
+    |--------------------------------------------------------------------------
+    */
+
+    const checkIns = await CheckIn.find({
+      habitId: habit._id,
+      userId: auth.userId,
+    })
+      .select("_id habitId localDate createdAt")
+      .sort({
+        localDate: 1,
+      })
+      .lean();
+
+    return NextResponse.json({
+      success: true,
+      checkIns,
+    });
+  } catch (error) {
+    console.error(
+      "================================"
+    );
+
+    console.error("GET CHECK-INS ERROR:");
+    console.error(error);
+
+    console.error(
+      "================================"
+    );
+
+    return NextResponse.json(
+      {
+        success: false,
+        message:
+          error?.message ||
+          "Failed to fetch check-ins",
       },
       {
         status: 500,
